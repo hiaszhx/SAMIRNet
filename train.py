@@ -61,14 +61,14 @@ def parse_args():
     parser.add_argument('--img_size', type=int, default=256)
     
     # Training
-    parser.add_argument('--epochs', type=int, default=400)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=0.0005)
+    parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--num_workers', type=int, default=4)
     
     # Loss weights
-    parser.add_argument('--det_weight', type=float, default=0.3)
+    parser.add_argument('--det_weight', type=float, default=0.7)
     parser.add_argument('--seg_weight', type=float, default=0.7)
     parser.add_argument('--iou_weight', type=float, default=0.1)
     
