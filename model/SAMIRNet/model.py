@@ -2,62 +2,55 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .swin_encoder import SwinTransformerEncoder
-# 修改导入：不再使用 FPN，改用新的 SmallTargetDetector
 from .small_target_detector import SmallTargetDetector
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
+from .fusion import UpBlock_attention # 确保你已经创建了 fusion.py
 
-class MultiScaleAdapter(nn.Module):
+class CrossScaleAdapter(nn.Module):
     """
-    探测头适配器：
-    将 Swin 的不同通道数的特征统一映射到固定维度，保持多尺度列表结构
+    升级版适配器：使用 Cross Attention 融合多尺度特征
+    学习 SAM-SPL 的 Decoder 结构
     """
-    def __init__(self, in_channels_list, out_channels):
+    def __init__(self, in_channels_list, embed_dim=256):
         super().__init__()
-        self.adapters = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(in_ch, out_channels, kernel_size=1),
-                nn.GroupNorm(16, out_channels), # 使用 GroupNorm 适应小 batch
-                nn.GELU(),
-                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-            ) for in_ch in in_channels_list
-        ])
+        self.embed_dim = embed_dim
         
-    def forward(self, features):
-        return [adapter(f) for adapter, f in zip(self.adapters, features)]
-
-class SegFeatureAdapter(nn.Module):
-    """
-    分割头适配器：
-    将多尺度特征融合为单一的高分辨率特征图 (Image Embedding)，供 Mask Decoder 使用
-    """
-    def __init__(self, in_channels_list, embed_dim):
-        super().__init__()
-        # 先投影到 embed_dim
+        # 1. 统一通道数
         self.projections = nn.ModuleList([
             nn.Conv2d(in_ch, embed_dim, kernel_size=1) for in_ch in in_channels_list
         ])
         
-        # 融合层
-        self.fusion = nn.Sequential(
-            nn.Conv2d(embed_dim * len(in_channels_list), embed_dim, kernel_size=3, padding=1),
+        # 2. 交叉注意力上采样块 (从深层到浅层逐级融合)
+        # P4 -> P3 -> P2 -> P1
+        self.up_blocks = nn.ModuleList([
+            UpBlock_attention(embed_dim, embed_dim, nb_Conv=1, MC=True), # P4+P3
+            UpBlock_attention(embed_dim, embed_dim, nb_Conv=1, MC=True), # +P2
+            UpBlock_attention(embed_dim, embed_dim, nb_Conv=1, MC=True)  # +P1
+        ])
+        
+        # 最终输出调整
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1),
             nn.BatchNorm2d(embed_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
+            nn.ReLU(inplace=True)
         )
-        
+
     def forward(self, features):
-        target_size = features[0].shape[2:]
-        projected_feats = []
+        # features: [P1, P2, P3, P4] (scales: 1/4, 1/8, 1/16, 1/32)
+        # 投影所有特征到统一维度
+        projs = [p(f) for p, f in zip(self.projections, features)]
+        p1, p2, p3, p4 = projs
         
-        for i, feat in enumerate(features):
-            x = self.projections[i](feat)
-            if x.shape[2:] != target_size:
-                x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
-            projected_feats.append(x)
-            
-        cat_feats = torch.cat(projected_feats, dim=1)
-        out = self.fusion(cat_feats)
+        # 逐级融合 (Deep-to-Shallow)
+        # p4 (1/32) -> p3 (1/16)
+        x = self.up_blocks[0](p4, p3)
+        # -> p2 (1/8)
+        x = self.up_blocks[1](x, p2)
+        # -> p1 (1/4)
+        x = self.up_blocks[2](x, p1)
+        
+        out = self.final_conv(x)
         return out
 
 class SAMIRNet(nn.Module):
@@ -69,8 +62,8 @@ class SAMIRNet(nn.Module):
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
         window_size=7,
-        fpn_dim=256,      # 探测头内部特征维度
-        decoder_dim=256,  # Mask Decoder 维度
+        fpn_dim=256,
+        decoder_dim=256,
         num_mask_tokens=3,
         use_scheduled_sampling=True
     ):
@@ -80,7 +73,7 @@ class SAMIRNet(nn.Module):
         self.use_scheduled_sampling = use_scheduled_sampling
         self.training_step = 0
         
-        # 1. Image Encoder (Swin Transformer)
+        # 1. Image Encoder
         self.encoder = SwinTransformerEncoder(
             img_size=img_size,
             embed_dim=embed_dim,
@@ -90,33 +83,38 @@ class SAMIRNet(nn.Module):
             pretrained_path=pretrained_path
         )
         
-        # --- 冻结 Image Encoder ---
-        # 我们希望只训练探测头、适配器和分割解码器
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        print("INFO: Image Encoder parameters frozen (Swin Transformer).")
+        # --- 策略调整：解冻高层参数 ---
+        # 冻结前两个 Stage (提取基础纹理)，解冻后两个 Stage (适应红外语义)
+        for name, param in self.encoder.named_parameters():
+            if "layers.0" in name or "layers.1" in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True # 允许训练深层
+        print("INFO: Image Encoder partially unfrozen (Stages 3 & 4 trainable).")
         
         encoder_dims = [embed_dim * (2 ** i) for i in range(len(depths))]
         
-        # 2. Adapters (新增)
-        # 探测头适配层：输出多尺度列表
-        self.det_adapter = MultiScaleAdapter(encoder_dims, out_channels=fpn_dim)
-        # 分割头适配层：输出单一特征图
-        self.seg_adapter = SegFeatureAdapter(encoder_dims, embed_dim=decoder_dim)
+        # 2. Adapters
+        # 探测分支适配 (保持简单，保留高频)
+        self.det_adapter = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, fpn_dim, 1),
+                nn.BatchNorm2d(fpn_dim),
+                nn.ReLU()
+            ) for dim in encoder_dims
+        ])
         
-        # 3. Detection Head (更换为 SmallTargetDetector)
-        self.detector = SmallTargetDetector(
-            in_channels=fpn_dim,
-            num_classes=1
-        )
+        # 分割分支适配 (升级为 Cross Attention 融合)
+        self.seg_adapter = CrossScaleAdapter(encoder_dims, embed_dim=decoder_dim)
         
-        # 4. Prompt Encoder
+        # 3. Detection Head (独立分支)
+        self.detector = SmallTargetDetector(in_channels=fpn_dim)
+        
+        # 4. Prompt Encoder & Mask Decoder
         self.prompt_encoder = PromptEncoder(
             embed_dim=decoder_dim,
             image_embedding_size=(img_size // 4, img_size // 4)
         )
-        
-        # 5. Mask Decoder
         self.mask_decoder = MaskDecoder(
             transformer_dim=decoder_dim,
             num_multimask_outputs=num_mask_tokens
@@ -125,47 +123,30 @@ class SAMIRNet(nn.Module):
     def forward(self, images, gt_centers=None, gt_masks=None, mode='train'):
         B = images.size(0)
         H, W = images.shape[-2:]
+        if images.size(1) == 1: images = images.repeat(1, 3, 1, 1)
         
-        if images.size(1) == 1:
-            images = images.repeat(1, 3, 1, 1)
-        
-        # 1. 获取 Encoder 特征 (冻结状态)
-        # 使用 no_grad 确保不计算梯度，节省显存
-        with torch.no_grad():
-            multi_scale_features = self.encoder(images)
+        # 1. Encoder (部分解冻)
+        multi_scale_features = self.encoder(images)
             
-        # 2. 分支一：探测分支 (Detection Branch)
-        # 适配 -> 探测 -> 热力图
-        det_features = self.det_adapter(multi_scale_features)
-        pred_heatmap, _ = self.detector(det_features)
+        # 2. 探测分支 (独立)
+        det_feats = [adapt(f) for adapt, f in zip(self.det_adapter, multi_scale_features)]
+        pred_heatmap, _ = self.detector(det_feats)
         
-        # 3. 生成 Prompts
+        # 3. 生成 Prompt
         if mode == 'train':
-            use_gt_prompt = self._should_use_gt_prompt()
-            if use_gt_prompt and gt_centers is not None:
-                prompt_points = gt_centers.clone()
-                prompt_points[:, :, 0] = prompt_points[:, :, 0] / W
-                prompt_points[:, :, 1] = prompt_points[:, :, 1] / H
+            use_gt = self._should_use_gt_prompt()
+            if use_gt and gt_centers is not None:
+                prompt_points = self._norm_points(gt_centers, H, W)
             else:
-                prompt_points = self._extract_centers_from_heatmap(
-                    pred_heatmap.detach(), top_k=3
-                )
+                prompt_points = self._extract_centers_from_heatmap(pred_heatmap.detach(), top_k=3)
         else:
-            prompt_points = self._extract_centers_from_heatmap(
-                pred_heatmap, top_k=5, threshold=0.3
-            )
+            prompt_points = self._extract_centers_from_heatmap(pred_heatmap, top_k=5, threshold=0.3)
         
-        # 4. 分支二：分割分支 (Segmentation Branch)
-        # 适配(融合) -> Image Embedding
-        image_embeddings = self.seg_adapter(multi_scale_features)
+        # 4. 分割分支 (Cross Attention 融合)
+        image_embeddings = self.seg_adapter(multi_scale_features) # Output: (B, 256, H/4, W/4)
         
-        # 5. Prompt Encoding
-        sparse_embeddings, dense_embeddings = self.prompt_encoder(
-            points=prompt_points, boxes=None, masks=None
-        )
-        
-        # 6. Mask Decoding
-        # 注意：这里直接传入 image_embeddings，它已经是 (B, 256, H/4, W/4)
+        # 5. SAM Decoding
+        sparse_embeddings, dense_embeddings = self.prompt_encoder(points=prompt_points, boxes=None, masks=None)
         low_res_masks, iou_predictions = self.mask_decoder(
             image_embeddings=image_embeddings,
             image_pe=self.prompt_encoder.get_dense_pe(),
@@ -174,30 +155,24 @@ class SAMIRNet(nn.Module):
             multimask_output=False
         )
         
-        # 7. 后处理
-        pred_masks = F.interpolate(
-            low_res_masks,
-            size=(self.img_size, self.img_size),
-            mode='bilinear',
-            align_corners=False
-        )
+        pred_masks = F.interpolate(low_res_masks, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
         pred_masks = torch.sigmoid(pred_masks)
         
-        if mode == 'train':
-            self.training_step += 1
-        
+        if mode == 'train': self.training_step += 1
         return pred_heatmap, pred_masks, iou_predictions
-    
+
+    def _norm_points(self, points, H, W):
+        norm_points = points.clone()
+        norm_points[:, :, 0] /= W
+        norm_points[:, :, 1] /= H
+        return norm_points
+
     def _should_use_gt_prompt(self):
         if not self.use_scheduled_sampling: return True
-        max_steps = 10000
-        min_prob = 0.5
-        if self.training_step < max_steps:
-            prob = 1.0 - (1.0 - min_prob) * (self.training_step / max_steps)
-        else:
-            prob = min_prob
+        # 随着训练进行，逐渐减少对 GT Prompt 的依赖
+        prob = max(0.3, 1.0 - (self.training_step / 15000)) 
         return torch.rand(1).item() < prob
-    
+
     def _extract_centers_from_heatmap(self, heatmap, top_k=3, threshold=0.3):
         """
         Extracts and normalizes center points to [0, 1]
@@ -241,6 +216,7 @@ class SAMIRNet(nn.Module):
         
         return torch.stack(centers_list, dim=0)
 
+# Helpers
 def SAMIRNet_Tiny(pretrained_path='./pretrained/swin_tiny_patch4_window7_224.pth'):
     return SAMIRNet(img_size=256, pretrained_path=pretrained_path, embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24])
 
