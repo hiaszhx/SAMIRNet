@@ -83,14 +83,12 @@ class SAMIRNet(nn.Module):
             pretrained_path=pretrained_path
         )
         
-        # --- 策略调整：解冻高层参数 ---
-        # 冻结前两个 Stage (提取基础纹理)，解冻后两个 Stage (适应红外语义)
-        for name, param in self.encoder.named_parameters():
-            if "layers.0" in name or "layers.1" in name:
-                param.requires_grad = False
-            else:
-                param.requires_grad = True # 允许训练深层
-        print("INFO: Image Encoder partially unfrozen (Stages 3 & 4 trainable).")
+        # --- 策略修改：彻底冻结 Image Encoder ---
+        # 为了将 Det Loss 和 Seg Loss 的影响彻底分开，我们冻结共享的 Encoder。
+        # 这样两个任务的梯度不会在 Backbone 处混合，而是分别更新各自的 Adapter 和 Head。
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        print(f"INFO: Image Encoder frozen (All parameters). Det and Seg branches are decoupled.")
         
         encoder_dims = [embed_dim * (2 ** i) for i in range(len(depths))]
         
@@ -125,10 +123,13 @@ class SAMIRNet(nn.Module):
         H, W = images.shape[-2:]
         if images.size(1) == 1: images = images.repeat(1, 3, 1, 1)
         
-        # 1. Encoder (部分解冻)
-        multi_scale_features = self.encoder(images)
+        # 1. Encoder (Frozen)
+        # 因为 Encoder 被冻结，这里只进行前向推理，不产生梯度回传到 Backbone
+        with torch.no_grad():
+            multi_scale_features = self.encoder(images)
             
         # 2. 探测分支 (独立)
+        # 梯度从这里开始计算，只回传到 det_adapter，不回传到 encoder
         det_feats = [adapt(f) for adapt, f in zip(self.det_adapter, multi_scale_features)]
         pred_heatmap, _ = self.detector(det_feats)
         
@@ -138,11 +139,13 @@ class SAMIRNet(nn.Module):
             if use_gt and gt_centers is not None:
                 prompt_points = self._norm_points(gt_centers, H, W)
             else:
+                # CRITICAL: 使用 detach() 确保 Seg Loss 不会反向传播影响 Det Head
                 prompt_points = self._extract_centers_from_heatmap(pred_heatmap.detach(), top_k=3)
         else:
             prompt_points = self._extract_centers_from_heatmap(pred_heatmap, top_k=5, threshold=0.3)
         
         # 4. 分割分支 (Cross Attention 融合)
+        # 梯度从这里开始计算，只回传到 seg_adapter，不回传到 encoder
         image_embeddings = self.seg_adapter(multi_scale_features) # Output: (B, 256, H/4, W/4)
         
         # 5. SAM Decoding
